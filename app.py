@@ -1,11 +1,10 @@
 import os
 import smtplib
-import sqlite3
 import logging
 from email.mime.text import MIMEText
 
 from flask import Flask, request, render_template_string
-from apscheduler.schedulers.background import BackgroundScheduler
+from google.cloud import firestore
 
 from mlb import get_todays_home_games, is_game_final, had_strikeout_side
 
@@ -13,67 +12,31 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+db = firestore.Client()
 
 # ---------------------------------------------------------------------------
-# Database (SQLite)
+# Database (Firestore)
 # ---------------------------------------------------------------------------
-
-DB_PATH = os.environ.get("DB_PATH", "cubs_chicken.db")
-
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    with get_db() as db:
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS subscribers (
-                email  TEXT PRIMARY KEY,
-                active INTEGER NOT NULL DEFAULT 1
-            )
-        """)
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS processed_games (
-                game_pk TEXT PRIMARY KEY
-            )
-        """)
-
 
 def add_subscriber(email):
-    with get_db() as db:
-        db.execute(
-            "INSERT OR REPLACE INTO subscribers (email, active) VALUES (?, 1)", (email,)
-        )
+    db.collection("subscribers").document(email).set({"active": True})
 
 
 def remove_subscriber(email):
-    with get_db() as db:
-        db.execute("UPDATE subscribers SET active = 0 WHERE email = ?", (email,))
+    db.collection("subscribers").document(email).update({"active": False})
 
 
 def get_active_subscribers():
-    with get_db() as db:
-        rows = db.execute(
-            "SELECT email FROM subscribers WHERE active = 1"
-        ).fetchall()
-    return [row["email"] for row in rows]
+    docs = db.collection("subscribers").where("active", "==", True).stream()
+    return [doc.id for doc in docs]
 
 
 def was_game_processed(game_pk):
-    with get_db() as db:
-        return db.execute(
-            "SELECT 1 FROM processed_games WHERE game_pk = ?", (str(game_pk),)
-        ).fetchone() is not None
+    return db.collection("processed_games").document(str(game_pk)).get().exists
 
 
 def mark_game_processed(game_pk):
-    with get_db() as db:
-        db.execute(
-            "INSERT OR IGNORE INTO processed_games (game_pk) VALUES (?)", (str(game_pk),)
-        )
+    db.collection("processed_games").document(str(game_pk)).set({})
 
 
 # ---------------------------------------------------------------------------
@@ -107,9 +70,8 @@ def send_alerts():
 
 
 # ---------------------------------------------------------------------------
-# Game checker (runs on schedule via APScheduler)
+# Game checker (called by Cloud Scheduler via POST /check)
 # ---------------------------------------------------------------------------
-
 
 def check_game():
     try:
@@ -232,16 +194,12 @@ def unsubscribe():
     return render_template_string(UNSUBSCRIBE_PAGE, message="You've been unsubscribed.")
 
 
-# ---------------------------------------------------------------------------
-# Startup
-# ---------------------------------------------------------------------------
+@app.route("/check", methods=["POST"])
+def check():
+    """Called by Cloud Scheduler every 10 minutes during baseball season."""
+    check_game()
+    return "", 204
 
-init_db()
-
-scheduler = BackgroundScheduler(daemon=True)
-# Runs every 10 minutes during baseball season (April–October)
-scheduler.add_job(check_game, "cron", minute="*/10", month="4-10")
-scheduler.start()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))

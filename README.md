@@ -7,10 +7,12 @@ People subscribe by entering their email on a small web form. The bot polls the 
 ## How it works
 
 - **MLB Stats API** (free, no key) — checks for completed Cubs home games and play-by-play strikeout data
-- **Gmail SMTP** — sends outbound emails; no third-party service needed
-- **SQLite** — stores subscribers and which games have already been processed
-- **APScheduler** — runs the game check on a cron inside the same process as the web server
-- **GCP e2-micro** — hosts everything on Google's Always Free tier (no trial, no expiry)
+- **Gmail SMTP** — sends outbound alerts; no third-party service needed
+- **Firestore** — stores subscribers and which games have already been processed
+- **Cloud Scheduler** — calls `POST /check` every 10 minutes during baseball season
+- **Cloud Run** — hosts the web form and game checker; scales to zero, no VM to manage
+
+Everything runs on GCP's Always Free tier.
 
 ## Prerequisites
 
@@ -25,131 +27,91 @@ People subscribe by entering their email on a small web form. The bot polls the 
 ```bash
 pip install -r requirements.txt
 
-cp .env.example .env
-# Fill in GMAIL_ADDRESS and GMAIL_APP_PASSWORD in .env
-# Leave DB_PATH unset or set to a local path
+# Authenticate with GCP so Firestore works locally
+gcloud auth application-default login
 
-source .env
+export GMAIL_ADDRESS=you@gmail.com
+export GMAIL_APP_PASSWORD="xxxx xxxx xxxx xxxx"
+
 python app.py
 ```
 
-The app runs at `http://localhost:8080`. Subscribe via the web form, or insert a row directly into the SQLite file to add yourself without going through the form.
+The app runs at `http://localhost:8080`.
 
-## Deployment on GCP e2-micro (free forever)
+## Deployment on GCP (free forever)
 
-GCP's Always Free tier includes one e2-micro VM permanently in `us-central1`, `us-east1`, or `us-west1`. No trial period, no credit card charges as long as you stay within the free limits (this app uses a tiny fraction of them).
+All services used — Cloud Run, Firestore, Cloud Scheduler, Secret Manager — are within GCP's Always Free tier at this scale.
 
-### 1. Create the VM
-
-In the [GCP Console](https://console.cloud.google.com/compute/instances):
-
-- **Machine type:** e2-micro
-- **Region:** us-central1, us-east1, or us-west1 (required for free tier)
-- **Boot disk:** Debian 12, 30 GB standard persistent disk
-- **Firewall:** check "Allow HTTP traffic" and "Allow HTTPS traffic"
-
-Or with the gcloud CLI:
+### 1. One-time project setup
 
 ```bash
-gcloud compute instances create cubs-chicken \
-  --machine-type=e2-micro \
-  --zone=us-central1-a \
-  --image-family=debian-12 \
-  --image-project=debian-cloud \
-  --boot-disk-size=30GB \
-  --boot-disk-type=pd-standard \
-  --tags=http-server,https-server
+# Set your project
+gcloud config set project YOUR_PROJECT_ID
+
+# Enable required APIs
+gcloud services enable \
+  run.googleapis.com \
+  firestore.googleapis.com \
+  cloudscheduler.googleapis.com \
+  secretmanager.googleapis.com
+
+# Create Firestore database (only needed once per project)
+gcloud firestore databases create --location=nam5
 ```
 
-### 2. Set up the VM
+### 2. Store secrets
 
-SSH into the instance (via the console browser SSH button or `gcloud compute ssh cubs-chicken`), then:
+Secrets live in Secret Manager — never in the repo or in plaintext config.
 
 ```bash
-sudo apt update && sudo apt install -y python3-pip python3-venv git
+echo -n "you@gmail.com" | \
+  gcloud secrets create gmail-address --data-file=-
 
-git clone <your-repo-url>
-cd cubs-chicken
-
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+echo -n "xxxx xxxx xxxx xxxx" | \
+  gcloud secrets create gmail-app-password --data-file=-
 ```
 
-### 3. Secrets
-
-Create a `.env` file directly on the VM — it stays on the server and never goes in the repo:
+To update a secret later:
 
 ```bash
-cat > /home/<your-user>/cubs-chicken/.env << 'EOF'
-GMAIL_ADDRESS=you@gmail.com
-GMAIL_APP_PASSWORD=xxxx xxxx xxxx xxxx
-DB_PATH=/home/<your-user>/cubs-chicken/cubs_chicken.db
-PORT=8080
-EOF
-chmod 600 .env
+echo -n "new value" | \
+  gcloud secrets versions add gmail-app-password --data-file=-
 ```
 
-### 4. Run as a systemd service
-
-This keeps the app running and restarts it automatically if the VM reboots:
+### 3. Deploy
 
 ```bash
-sudo nano /etc/systemd/system/cubs-chicken.service
+gcloud run deploy cubs-chicken \
+  --source . \
+  --region us-central1 \
+  --allow-unauthenticated \
+  --set-secrets=GMAIL_ADDRESS=gmail-address:latest,GMAIL_APP_PASSWORD=gmail-app-password:latest
 ```
 
-Paste:
+`--source .` builds and deploys in one step — no Docker required. The command prints the service URL when done (e.g. `https://cubs-chicken-xxx-uc.a.run.app`).
 
-```ini
-[Unit]
-Description=Cubs Chick-fil-A Alert Bot
-After=network.target
-
-[Service]
-User=<your-user>
-WorkingDirectory=/home/<your-user>/cubs-chicken
-EnvironmentFile=/home/<your-user>/cubs-chicken/.env
-ExecStart=/home/<your-user>/cubs-chicken/venv/bin/python app.py
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Then enable and start it:
+### 4. Create the Cloud Scheduler job
 
 ```bash
-sudo systemctl daemon-reload
-sudo systemctl enable cubs-chicken
-sudo systemctl start cubs-chicken
+SERVICE_URL=$(gcloud run services describe cubs-chicken \
+  --region us-central1 \
+  --format="value(status.url)")
 
-# Confirm it's running
-sudo systemctl status cubs-chicken
+gcloud scheduler jobs create http cubs-chicken-checker \
+  --schedule="*/10 * * 4-10 *" \
+  --uri="${SERVICE_URL}/check" \
+  --http-method=POST \
+  --location=us-central1
 ```
 
-### 5. Open port 8080
+This fires every 10 minutes during April–October. The handler exits immediately if there's no home game or the game isn't final yet.
+
+### Subsequent deploys
 
 ```bash
-gcloud compute firewall-rules create allow-cubs-chicken \
-  --allow=tcp:8080 \
-  --target-tags=http-server
-```
-
-The web form is then available at `http://<VM-external-IP>:8080`. Find the external IP in the GCP Console under Compute Engine → VM instances.
-
-### Updating the app
-
-```bash
-cd cubs-chicken
-git pull
-sudo systemctl restart cubs-chicken
+gcloud run deploy cubs-chicken --source . --region us-central1
 ```
 
 ### Subscribing yourself
 
-Visit `http://<VM-external-IP>:8080` and enter your email, or add yourself directly:
-
-```bash
-sqlite3 cubs_chicken.db \
-  "INSERT INTO subscribers (email, active) VALUES ('you@email.com', 1);"
-```
+Visit the service URL and enter your email, or add yourself directly via the Firestore console at `console.cloud.google.com/firestore` — create a document in the `subscribers` collection with your email as the document ID and `{"active": true}`.
