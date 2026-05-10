@@ -50,8 +50,10 @@ def mark_game_processed(game_pk):
 
 ALERT_SUBJECT = "Cubs Chick-fil-A Alert"
 ALERT_BODY = (
-    "Cubs struck out the side tonight! Open your Chick-fil-A app NOW "
-    "to claim your free reward before it expires!"
+    "A Cubs pitcher struck out the side tonight (3 strikeouts in one inning "
+    "at a home game) — that triggers the Chick-fil-A free reward!\n\n"
+    "Open the Chick-fil-A app NOW and claim your reward before it expires. "
+    "The window is short, so don't wait."
 )
 
 
@@ -130,8 +132,11 @@ SUBSCRIBE_PAGE = """<!DOCTYPE html>
 </head>
 <body>
   <h2>Cubs Chick-fil-A Alerts</h2>
-  <p>Get an email when a Cubs pitcher strikes out the side at a home game so you
-     can claim your free Chick-fil-A reward in time.</p>
+  <p>When a Cubs pitcher strikes out the side — 3 strikeouts in a single inning
+     at a home game — Chick-fil-A offers a free reward in their app. The window
+     to claim it is short and easy to miss.</p>
+  <p>Subscribe and you'll get an email the moment the game ends. Open the
+     Chick-fil-A app right away and claim the reward before it expires.</p>
   <form method="POST" action="/subscribe">
     <input type="email" name="email" placeholder="your@email.com" required>
     <button type="submit">Subscribe</button>
