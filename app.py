@@ -1,11 +1,9 @@
 import os
-import re
 import smtplib
 import sqlite3
 import logging
 from email.mime.text import MIMEText
 
-import requests
 from flask import Flask, request, render_template_string
 from apscheduler.schedulers.background import BackgroundScheduler
 
@@ -33,9 +31,8 @@ def init_db():
     with get_db() as db:
         db.execute("""
             CREATE TABLE IF NOT EXISTS subscribers (
-                phone   TEXT PRIMARY KEY,
-                gateway TEXT NOT NULL,
-                active  INTEGER NOT NULL DEFAULT 1
+                email  TEXT PRIMARY KEY,
+                active INTEGER NOT NULL DEFAULT 1
             )
         """)
         db.execute("""
@@ -45,25 +42,24 @@ def init_db():
         """)
 
 
-def add_subscriber(phone, gateway):
+def add_subscriber(email):
     with get_db() as db:
         db.execute(
-            "INSERT OR REPLACE INTO subscribers (phone, gateway, active) VALUES (?, ?, 1)",
-            (phone, gateway),
+            "INSERT OR REPLACE INTO subscribers (email, active) VALUES (?, 1)", (email,)
         )
 
 
-def remove_subscriber(phone):
+def remove_subscriber(email):
     with get_db() as db:
-        db.execute("UPDATE subscribers SET active = 0 WHERE phone = ?", (phone,))
+        db.execute("UPDATE subscribers SET active = 0 WHERE email = ?", (email,))
 
 
 def get_active_subscribers():
     with get_db() as db:
         rows = db.execute(
-            "SELECT phone, gateway FROM subscribers WHERE active = 1"
+            "SELECT email FROM subscribers WHERE active = 1"
         ).fetchall()
-    return [(row["phone"], row["gateway"]) for row in rows]
+    return [row["email"] for row in rows]
 
 
 def was_game_processed(game_pk):
@@ -81,76 +77,33 @@ def mark_game_processed(game_pk):
 
 
 # ---------------------------------------------------------------------------
-# Carrier lookup -> email gateway
+# Email alerts (Gmail SMTP)
 # ---------------------------------------------------------------------------
 
-# Substrings matched against the carrier name returned by the lookup API
-CARRIER_GATEWAYS = {
-    "t-mobile":   "tmomail.net",
-    "metro":      "tmomail.net",      # Metro by T-Mobile
-    "at&t":       "txt.att.net",
-    "att":        "txt.att.net",
-    "cricket":    "sms.cricketwireless.net",
-    "verizon":    "vtext.com",
-    "sprint":     "messaging.sprintpcs.com",
-    "boost":      "sms.myboostmobile.com",
-    "dish":       "sms.myboostmobile.com",
-    "us cellular": "email.uscc.net",
-    "uscellular":  "email.uscc.net",
-}
-
-
-def lookup_gateway(digits):
-    """
-    Calls freecarrierlookup.com to find the carrier, then returns the
-    email-to-SMS gateway address (e.g. '9165056940@tmomail.net').
-
-    API docs: https://freecarrierlookup.com  (free account required)
-    Expected response: {"success": true, "carrier": "T-Mobile USA", "linetype": "mobile"}
-    """
-    resp = requests.get(
-        "https://freecarrierlookup.com/api_getcarrier.php",
-        params={"apikey": os.environ["CARRIER_LOOKUP_API_KEY"], "phoneno": digits},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-
-    carrier_name = data.get("carrier", "").lower()
-    for keyword, domain in CARRIER_GATEWAYS.items():
-        if keyword in carrier_name:
-            return f"{digits}@{domain}"
-
-    raise ValueError(f"Unsupported carrier: {data.get('carrier')!r}")
-
-
-# ---------------------------------------------------------------------------
-# Outbound SMS via carrier email gateways (Gmail SMTP)
-# ---------------------------------------------------------------------------
-
+ALERT_SUBJECT = "Cubs Chick-fil-A Alert"
 ALERT_BODY = (
     "Cubs struck out the side tonight! Open your Chick-fil-A app NOW "
     "to claim your free reward before it expires!"
 )
 
 
-def send_sms_email(to_gateway, body):
+def send_email(to_addr, subject, body):
     msg = MIMEText(body)
     msg["From"] = os.environ["GMAIL_ADDRESS"]
-    msg["To"] = to_gateway
-    msg["Subject"] = ""
+    msg["To"] = to_addr
+    msg["Subject"] = subject
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
         smtp.login(os.environ["GMAIL_ADDRESS"], os.environ["GMAIL_APP_PASSWORD"])
         smtp.send_message(msg)
 
 
 def send_alerts():
-    for phone, gateway in get_active_subscribers():
+    for email in get_active_subscribers():
         try:
-            send_sms_email(gateway, ALERT_BODY)
-            logger.info(f"Alert sent to {phone}")
+            send_email(email, ALERT_SUBJECT, ALERT_BODY)
+            logger.info(f"Alert sent to {email}")
         except Exception as e:
-            logger.error(f"Failed to send to {phone}: {e}")
+            logger.error(f"Failed to send to {email}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +146,7 @@ SUBSCRIBE_PAGE = """<!DOCTYPE html>
   <style>
     body { font-family: sans-serif; max-width: 420px; margin: 60px auto; padding: 0 20px; color: #222; }
     h2   { color: #0E3386; }
-    input[type=tel] {
+    input[type=email] {
       width: 100%; padding: 10px; font-size: 16px;
       margin: 8px 0 12px; box-sizing: border-box;
       border: 1px solid #ccc; border-radius: 4px;
@@ -210,10 +163,10 @@ SUBSCRIBE_PAGE = """<!DOCTYPE html>
 </head>
 <body>
   <h2>Cubs Chick-fil-A Alerts</h2>
-  <p>Get a text when a Cubs pitcher strikes out the side at a home game so you
+  <p>Get an email when a Cubs pitcher strikes out the side at a home game so you
      can claim your free Chick-fil-A reward in time.</p>
   <form method="POST" action="/subscribe">
-    <input type="tel" name="phone" placeholder="US phone number" required>
+    <input type="email" name="email" placeholder="your@email.com" required>
     <button type="submit">Subscribe</button>
   </form>
   {% if message %}
@@ -230,7 +183,7 @@ UNSUBSCRIBE_PAGE = """<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     body { font-family: sans-serif; max-width: 420px; margin: 60px auto; padding: 0 20px; }
-    input[type=tel] {
+    input[type=email] {
       width: 100%; padding: 10px; font-size: 16px;
       margin: 8px 0 12px; box-sizing: border-box;
       border: 1px solid #ccc; border-radius: 4px;
@@ -245,7 +198,7 @@ UNSUBSCRIBE_PAGE = """<!DOCTYPE html>
 <body>
   <h2>Unsubscribe</h2>
   <form method="POST">
-    <input type="tel" name="phone" placeholder="Your phone number" required>
+    <input type="email" name="email" placeholder="your@email.com" required>
     <button type="submit">Unsubscribe</button>
   </form>
   {% if message %}
@@ -255,13 +208,6 @@ UNSUBSCRIBE_PAGE = """<!DOCTYPE html>
 </html>"""
 
 
-def normalize_phone(raw):
-    digits = re.sub(r"\D", "", raw)
-    if len(digits) == 11 and digits.startswith("1"):
-        digits = digits[1:]
-    return digits if len(digits) == 10 else None
-
-
 @app.route("/")
 def index():
     return render_template_string(SUBSCRIBE_PAGE, message=None, css=None)
@@ -269,18 +215,10 @@ def index():
 
 @app.route("/subscribe", methods=["POST"])
 def subscribe():
-    digits = normalize_phone(request.form.get("phone", ""))
-    if not digits:
-        return render_template_string(SUBSCRIBE_PAGE, message="Invalid phone number.", css="err")
-    try:
-        gateway = lookup_gateway(digits)
-    except ValueError as e:
-        return render_template_string(SUBSCRIBE_PAGE, message=str(e), css="err")
-    except Exception:
-        return render_template_string(
-            SUBSCRIBE_PAGE, message="Carrier lookup failed — try again.", css="err"
-        )
-    add_subscriber(digits, gateway)
+    email = request.form.get("email", "").strip().lower()
+    if not email:
+        return render_template_string(SUBSCRIBE_PAGE, message="Invalid email.", css="err")
+    add_subscriber(email)
     return render_template_string(SUBSCRIBE_PAGE, message="You're subscribed!", css="ok")
 
 
@@ -288,9 +226,9 @@ def subscribe():
 def unsubscribe():
     if request.method == "GET":
         return render_template_string(UNSUBSCRIBE_PAGE, message=None)
-    digits = normalize_phone(request.form.get("phone", ""))
-    if digits:
-        remove_subscriber(digits)
+    email = request.form.get("email", "").strip().lower()
+    if email:
+        remove_subscriber(email)
     return render_template_string(UNSUBSCRIBE_PAGE, message="You've been unsubscribed.")
 
 
