@@ -6,7 +6,7 @@ from email.mime.text import MIMEText
 from flask import Flask, request, render_template_string, redirect, url_for
 from google.cloud import firestore
 
-from mlb import get_todays_home_games, is_game_final, had_strikeout_side, get_recent_home_games, get_strikeout_details
+from mlb import get_todays_home_games, is_game_final, get_strikeout_side_details, get_recent_home_games, get_strikeout_details
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -48,13 +48,41 @@ def mark_game_processed(game_pk):
 # Email alerts (Gmail SMTP)
 # ---------------------------------------------------------------------------
 
-ALERT_SUBJECT = "Cubs Chick-fil-A Alert"
-ALERT_BODY = (
-    "A Cubs pitcher struck out the side tonight (3 strikeouts in one inning "
-    "at a home game) — that triggers the Chick-fil-A free reward!\n\n"
-    "Open the Chick-fil-A app NOW and claim your reward before it expires. "
-    "The window is short, so don't wait."
-)
+ALERT_SUBJECT = "Cubs Strikeout the Side!"
+
+
+def _ordinal(n):
+    suffix = {1: "st", 2: "nd", 3: "rd"}.get(
+        n % 10 if n % 100 not in (11, 12, 13) else 0, "th"
+    )
+    return f"{n}{suffix}"
+
+
+def build_alert_body(inning_details, opponent):
+    detail_lines = []
+    for inning in sorted(inning_details):
+        pitchers = inning_details[inning]
+        total_ks = sum(pitchers.values())
+        inn_str = _ordinal(inning)
+        if len(pitchers) == 1:
+            pitcher = list(pitchers)[0]
+            detail_lines.append(
+                f"{pitcher} struck out {total_ks} in the {inn_str} inning vs. the {opponent}."
+            )
+        else:
+            breakdown = ", ".join(f"{p} ({k}K)" for p, k in pitchers.items())
+            detail_lines.append(
+                f"Cubs pitchers combined for {total_ks} strikeouts in the {inn_str} inning "
+                f"vs. the {opponent} ({breakdown})."
+            )
+    details = "\n".join(detail_lines)
+    return (
+        "A Cubs pitcher struck out the side tonight (3 strikeouts in one inning "
+        "at a home game) — that triggers the Chick-fil-A free reward!\n\n"
+        f"{details}\n\n"
+        "Open the Chick-fil-A app NOW and claim your reward before it expires. "
+        "The window is short, so don't wait."
+    )
 
 
 def send_email(to_addr, subject, body):
@@ -67,10 +95,11 @@ def send_email(to_addr, subject, body):
         smtp.send_message(msg)
 
 
-def send_alerts():
+def send_alerts(inning_details, opponent):
+    body = build_alert_body(inning_details, opponent)
     for email in get_active_subscribers():
         try:
-            send_email(email, ALERT_SUBJECT, ALERT_BODY)
+            send_email(email, ALERT_SUBJECT, body)
             logger.info(f"Alert sent to {email}")
         except Exception as e:
             logger.error(f"Failed to send to {email}: {e}")
@@ -92,9 +121,11 @@ def check_game():
         if not is_game_final(game) or was_game_processed(game_pk):
             continue
         try:
-            if had_strikeout_side(game_pk):
+            triggered, inning_details = get_strikeout_side_details(game_pk)
+            if triggered:
+                opponent = game["teams"]["away"]["team"]["name"]
                 logger.info(f"Strikeout side in game {game_pk} — sending alerts")
-                send_alerts()
+                send_alerts(inning_details, opponent)
             else:
                 logger.info(f"Game {game_pk} final, no strikeout side")
         except Exception as e:
@@ -132,11 +163,9 @@ SUBSCRIBE_PAGE = """<!DOCTYPE html>
 </head>
 <body>
   <h2>Cubs Chick-fil-A Alerts</h2>
-  <p>When a Cubs pitcher strikes out the side — 3 strikeouts in a single inning
-     at a home game — Chick-fil-A offers a free reward in their app. The window
-     to claim it is short and easy to miss.</p>
+  <p>When a Cubs pitcher strikes out the side Chick-fil-A offers a free reward in their app.</p>
   <p>Subscribe and you'll get an email the moment the game ends. Open the
-     Chick-fil-A app right away and claim the reward before it expires.</p>
+     Chick-fil-A app right away and claim the reward before it expires!</p>
   <form method="POST" action="/subscribe">
     <input type="email" name="email" placeholder="your@email.com" required>
     <button type="submit">Subscribe</button>
