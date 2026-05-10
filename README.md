@@ -71,14 +71,23 @@ echo -n "xxxx xxxx xxxx xxxx" | \
   gcloud secrets create gmail-app-password --data-file=-
 ```
 
-To update a secret later:
+### 3. Grant Secret Manager access to Cloud Run
+
+Cloud Run runs as the default compute service account, which needs explicit permission to read secrets. Get your project number first:
 
 ```bash
-echo -n "new value" | \
-  gcloud secrets versions add gmail-app-password --data-file=-
+gcloud projects describe YOUR_PROJECT_ID --format="value(projectNumber)"
 ```
 
-### 3. Deploy
+Then grant the role:
+
+```bash
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
+  --member="serviceAccount:YOUR_PROJECT_NUMBER-compute@developer.gserviceaccount.com" \
+  --role="roles/secretmanager.secretAccessor"
+```
+
+### 4. Deploy
 
 ```bash
 gcloud run deploy cubs-chicken \
@@ -90,7 +99,7 @@ gcloud run deploy cubs-chicken \
 
 `--source .` builds and deploys in one step — no Docker required. The command prints the service URL when done (e.g. `https://cubs-chicken-xxx-uc.a.run.app`).
 
-### 4. Create the Cloud Scheduler job
+### 5. Create the Cloud Scheduler job
 
 ```bash
 SERVICE_URL=$(gcloud run services describe cubs-chicken \
@@ -106,12 +115,44 @@ gcloud scheduler jobs create http cubs-chicken-checker \
 
 This fires every 10 minutes during April–October. The handler exits immediately if there's no home game or the game isn't final yet.
 
-### Subsequent deploys
+### Subscribing yourself
+
+Visit the service URL and enter your email. Or add yourself directly via the Firestore console at `console.cloud.google.com/firestore` — create a document in the `subscribers` collection with your email as the document ID and `{"active": true}`.
+
+### Testing the MLB logic
+
+`POST /test` emails `chid.muthu@gmail.com` a summary of the last 20 completed Cubs home games — whether each one triggered the strikeout-side condition and the per-inning strikeout counts. Nothing is written to Firestore. Useful for verifying the MLB API integration after a code change:
+
+```bash
+curl -X POST "${SERVICE_URL}/test"
+```
+
+---
+
+## Redeploying after code changes
+
+Redeploy with the same source command — Cloud Run keeps all existing configuration (secrets, env vars) so you don't need to pass them again:
 
 ```bash
 gcloud run deploy cubs-chicken --source . --region us-central1
 ```
 
-### Subscribing yourself
+The command builds a new container image, pushes it to Artifact Registry, and updates the Cloud Run service in place. Existing subscribers and processed games in Firestore are unaffected. The command prints the service URL when done.
 
-Visit the service URL and enter your email, or add yourself directly via the Firestore console at `console.cloud.google.com/firestore` — create a document in the `subscribers` collection with your email as the document ID and `{"active": true}`.
+**What requires a redeploy:**
+- Any change to `app.py`, `mlb.py`, or other Python files
+- Adding or removing packages in `requirements.txt`
+
+**What does NOT require a redeploy:**
+- Rotating secrets (see "Updating secrets" below) — changes take effect on the next request automatically
+
+## Updating secrets
+
+To rotate the Gmail App Password:
+
+```bash
+echo -n "new app password" | \
+  gcloud secrets versions add gmail-app-password --data-file=-
+```
+
+Secret Manager updates take effect on the next Cloud Run request — no redeploy needed.

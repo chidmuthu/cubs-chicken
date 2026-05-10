@@ -3,10 +3,10 @@ import smtplib
 import logging
 from email.mime.text import MIMEText
 
-from flask import Flask, request, render_template_string
+from flask import Flask, request, render_template_string, redirect, url_for
 from google.cloud import firestore
 
-from mlb import get_todays_home_games, is_game_final, had_strikeout_side
+from mlb import get_todays_home_games, is_game_final, had_strikeout_side, get_recent_home_games, get_strikeout_details
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,6 +29,11 @@ def remove_subscriber(email):
 def get_active_subscribers():
     docs = db.collection("subscribers").where("active", "==", True).stream()
     return [doc.id for doc in docs]
+
+
+def is_active_subscriber(email):
+    doc = db.collection("subscribers").document(email).get()
+    return doc.exists and doc.to_dict().get("active", False)
 
 
 def was_game_processed(game_pk):
@@ -175,13 +180,17 @@ def index():
     return render_template_string(SUBSCRIBE_PAGE, message=None, css=None)
 
 
-@app.route("/subscribe", methods=["POST"])
+@app.route("/subscribe", methods=["GET", "POST"])
 def subscribe():
+    if request.method == "GET":
+        return redirect(url_for("index"))
     email = request.form.get("email", "").strip().lower()
     if not email:
-        return render_template_string(SUBSCRIBE_PAGE, message="Invalid email.", css="err")
+        return render_template_string(SUBSCRIBE_PAGE, message="Please enter a valid email.", css="err")
+    if is_active_subscriber(email):
+        return render_template_string(SUBSCRIBE_PAGE, message=f"{email} is already subscribed.", css="ok")
     add_subscriber(email)
-    return render_template_string(SUBSCRIBE_PAGE, message="You're subscribed!", css="ok")
+    return render_template_string(SUBSCRIBE_PAGE, message=f"{email} is subscribed!", css="ok")
 
 
 @app.route("/unsubscribe", methods=["GET", "POST"])
@@ -189,9 +198,49 @@ def unsubscribe():
     if request.method == "GET":
         return render_template_string(UNSUBSCRIBE_PAGE, message=None)
     email = request.form.get("email", "").strip().lower()
-    if email:
-        remove_subscriber(email)
-    return render_template_string(UNSUBSCRIBE_PAGE, message="You've been unsubscribed.")
+    if not email:
+        return render_template_string(UNSUBSCRIBE_PAGE, message="Please enter a valid email.")
+    remove_subscriber(email)
+    return render_template_string(UNSUBSCRIBE_PAGE, message=f"{email} has been unsubscribed.")
+
+
+TEST_EMAIL = "chid.muthu@gmail.com"
+
+
+@app.route("/test", methods=["POST"])
+def test_check():
+    """Send a diagnostic email summarizing the last 20 Cubs home games."""
+    try:
+        recent = get_recent_home_games(20)
+    except Exception as e:
+        logger.error(f"MLB API error during /test: {e}")
+        return f"MLB API error: {e}", 500
+
+    lines = [f"Cubs strikeout-side check — last {len(recent)} completed home games\n"]
+    for game_date, game in recent:
+        game_pk = game["gamePk"]
+        away_team = game["teams"]["away"]["team"]["name"]
+        try:
+            triggered, inning_ks = get_strikeout_details(game_pk)
+        except Exception as e:
+            lines.append(f"{game_date} vs {away_team} (pk={game_pk}): ERROR — {e}\n")
+            continue
+
+        status = "YES — STRIKEOUT SIDE" if triggered else "no"
+        ks_summary = ", ".join(
+            f"inn {inn}: {k}K" for inn, k in sorted(inning_ks.items())
+        ) or "0 strikeouts"
+        lines.append(f"{game_date} vs {away_team} (pk={game_pk}): {status}\n  {ks_summary}\n")
+
+    body = "\n".join(lines)
+    try:
+        send_email(TEST_EMAIL, "Cubs Bot — Test Results", body)
+        logger.info(f"Test email sent to {TEST_EMAIL}")
+    except Exception as e:
+        logger.error(f"Failed to send test email: {e}")
+        return f"Email error: {e}", 500
+
+    return f"Test email sent to {TEST_EMAIL}", 200
 
 
 @app.route("/check", methods=["POST"])
