@@ -1,5 +1,7 @@
 # Cubs Chick-fil-A Alert Bot
 
+**Live:** https://cubs-chicken-502202734146.us-central1.run.app
+
 Sends an email alert when a Cubs pitcher strikes out the side (3 Ks in one inning) at a home game. Chick-fil-A offers a free reward after these games, but only for a short window — this bot catches it so you don't miss it.
 
 People subscribe by entering their email on a small web form. The bot polls the MLB Stats API every 10 minutes during baseball season and emails all subscribers as soon as the game ends.
