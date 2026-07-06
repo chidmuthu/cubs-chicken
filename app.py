@@ -6,7 +6,7 @@ from email.mime.text import MIMEText
 from flask import Flask, request, render_template_string, redirect, url_for
 from google.cloud import firestore
 
-from mlb import get_todays_home_games, is_game_final, get_strikeout_side_details, get_recent_home_games, get_strikeout_details
+from mlb import get_strikeout_side_details, get_recent_home_games, get_strikeout_details
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,8 +40,15 @@ def was_game_processed(game_pk):
     return db.collection("processed_games").document(str(game_pk)).get().exists
 
 
-def mark_game_processed(game_pk):
-    db.collection("processed_games").document(str(game_pk)).set({})
+def mark_game_processed(game_pk, game_date="", opponent="", triggered=False, inning_details=None):
+    db.collection("processed_games").document(str(game_pk)).set({
+        "game_pk": game_pk,
+        "game_date": game_date,
+        "opponent": opponent,
+        "strikeout_side": triggered,
+        "inning_details": {str(inn): pitchers for inn, pitchers in (inning_details or {}).items()},
+        "processed_at": firestore.SERVER_TIMESTAMP,
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -49,6 +56,7 @@ def mark_game_processed(game_pk):
 # ---------------------------------------------------------------------------
 
 ALERT_SUBJECT = "Cubs Strikeout the Side!"
+TEST_EMAIL = "chid.muthu@gmail.com"
 
 
 def _ordinal(n):
@@ -97,12 +105,38 @@ def send_email(to_addr, subject, body):
 
 def send_alerts(inning_details, opponent):
     body = build_alert_body(inning_details, opponent)
-    for email in get_active_subscribers():
+    subscribers = get_active_subscribers()
+    logger.info(f"Sending alerts to {len(subscribers)} subscriber(s): {subscribers}")
+    for email in subscribers:
         try:
             send_email(email, ALERT_SUBJECT, body)
             logger.info(f"Alert sent to {email}")
         except Exception as e:
             logger.error(f"Failed to send to {email}: {e}")
+
+
+def send_process_notification(game_pk, game_date, opponent, triggered, inning_details):
+    status = "YES — STRIKEOUT SIDE TRIGGERED" if triggered else "No strikeout side"
+    if inning_details:
+        detail_lines = []
+        for inning in sorted(inning_details):
+            pitchers = inning_details[inning]
+            total_ks = sum(pitchers.values())
+            breakdown = ", ".join(f"{p}: {k}K" for p, k in pitchers.items())
+            detail_lines.append(f"  Inning {inning}: {total_ks} Ks ({breakdown})")
+        details = "\n".join(detail_lines)
+    else:
+        details = "  No triggering innings"
+    body = (
+        f"Game processed: {game_date} vs {opponent} (pk={game_pk})\n"
+        f"Result: {status}\n\n"
+        f"Inning details:\n{details}"
+    )
+    try:
+        send_email(TEST_EMAIL, f"Cubs Bot — Processed: {game_date} vs {opponent}", body)
+        logger.info(f"Process notification sent to {TEST_EMAIL}")
+    except Exception as e:
+        logger.error(f"Failed to send process notification: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -111,27 +145,42 @@ def send_alerts(inning_details, opponent):
 
 def check_game():
     try:
-        games = get_todays_home_games()
+        recent = get_recent_home_games(1)
     except Exception as e:
-        logger.error(f"MLB API error: {e}")
-        return
+        logger.error(f"MLB API error fetching recent home games: {e}")
+        return False
 
-    for game in games:
-        game_pk = game["gamePk"]
-        if not is_game_final(game) or was_game_processed(game_pk):
-            continue
-        try:
-            triggered, inning_details = get_strikeout_side_details(game_pk)
-            if triggered:
-                opponent = game["teams"]["away"]["team"]["name"]
-                logger.info(f"Strikeout side in game {game_pk} — sending alerts")
-                send_alerts(inning_details, opponent)
-            else:
-                logger.info(f"Game {game_pk} final, no strikeout side")
-        except Exception as e:
-            logger.error(f"Error processing game {game_pk}: {e}")
-        finally:
-            mark_game_processed(game_pk)
+    if not recent:
+        logger.info("No completed Cubs home games found")
+        return False
+
+    game_date, game = recent[0]
+    game_pk = game["gamePk"]
+    opponent = game["teams"]["away"]["team"]["name"]
+    logger.info(f"Most recent completed home game: {game_date} vs {opponent} (pk={game_pk})")
+
+    if was_game_processed(game_pk):
+        logger.info(f"Game {game_pk} already processed, skipping")
+        return False
+
+    logger.info(f"Game {game_pk} not yet processed — fetching strikeout data")
+    triggered = False
+    inning_details = {}
+    try:
+        triggered, inning_details = get_strikeout_side_details(game_pk)
+        logger.info(f"Game {game_pk}: strikeout_side={triggered}, inning_details={inning_details}")
+        if triggered:
+            logger.info(f"Strikeout side confirmed — sending alerts to subscribers")
+            send_alerts(inning_details, opponent)
+        else:
+            logger.info(f"Game {game_pk} vs {opponent}: no strikeout side, no alerts sent")
+    except Exception as e:
+        logger.error(f"Error fetching strikeout data for game {game_pk}: {e}")
+    finally:
+        mark_game_processed(game_pk, game_date, opponent, triggered, inning_details)
+        send_process_notification(game_pk, game_date, opponent, triggered, inning_details)
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -238,9 +287,6 @@ def unsubscribe():
     return render_template_string(UNSUBSCRIBE_PAGE, message=f"{email} has been unsubscribed.")
 
 
-TEST_EMAIL = "chid.muthu@gmail.com"
-
-
 @app.route("/test", methods=["POST"])
 def test_check():
     """Send a diagnostic email summarizing the last 20 Cubs home games."""
@@ -280,8 +326,8 @@ def test_check():
 @app.route("/check", methods=["POST"])
 def check():
     """Called by Cloud Scheduler every 10 minutes during baseball season."""
-    check_game()
-    return "", 204
+    processed = check_game()
+    return ("", 200) if processed else ("", 204)
 
 
 if __name__ == "__main__":
